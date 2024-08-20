@@ -1,90 +1,80 @@
-from queue import Queue
-from threading import Thread
 import cdsapi
-import datetime
 import os
+from datetime import datetime, timedelta
+import threading
+from queue import Queue
 
-os.environ["http_proxy"] = "http://127.0.0.1:10810"
-os.environ["https_proxy"] = "http://127.0.0.1:10810"
+class Era5Downloader:
+    def __init__(self, dataset, variable, start_date, end_date, save_path, max_threads=4):
+        self.client = cdsapi.Client()
+        self.dataset = dataset
+        self.variable = variable
+        self.start_date = start_date
+        self.end_date = end_date
+        self.save_path = save_path
+        self.max_threads = max_threads
+        self.queue = Queue()
+        self._prepare_queue()
 
-def downloadonefile(riqi):
+        if not os.path.exists(save_path):
+            os.makedirs(save_path)
 
-    year, month, day=riqi.values()
-    filename = r"F:\\raster\\ERA5\\2m_temperature\\" + 'ERA5_2m_temperature_{}_{}_{}'.format(year, month, day) + ".nc"
-    if (os.path.isfile(filename)):  # 如果存在文件名则返回
-        print("ok", filename)
-    else:
-        print(filename)
-        c = cdsapi.Client()
-        c.retrieve(
-            'reanalysis-era5-single-levels',
-            {
-                'product_type': 'reanalysis',
-                'format': 'netcdf',  # Supported format: grib and netcdf. Default: grib
-                'variable': '2m_temperature',
-                'year': year,
-                'month': month,
-                'day': day,
-                'time': [
-                    '00:00', '01:00', '02:00',
-                    '03:00', '04:00', '05:00',
-                    '06:00', '07:00', '08:00',
-                    '09:00', '10:00', '11:00',
-                    '12:00', '13:00', '14:00',
-                    '15:00', '16:00', '17:00',
-                    '18:00', '19:00', '20:00',
-                    '21:00', '22:00', '23:00'
-                ],
+    def _prepare_queue(self):
+        current_date = self.start_date
+        while current_date <= self.end_date:
+            for hour in range(24):  # 一天内的所有时间点
+                time = f"{hour:02d}:00"
+                # 更新文件名格式，只保留年月日和小时
+                save_file = os.path.join(
+                    self.save_path,
+                    f"{self.variable[0]}_{current_date.strftime('%Y%m%d')}_{hour:02d}.nc"
+                )
+                self.queue.put((current_date, time, save_file))
+            current_date += timedelta(days=1)
 
-            },
-            filename)
+    def _download_data(self):
+        while not self.queue.empty():
+            date, time, save_file = self.queue.get()
+            if os.path.exists(save_file):
+                print(f"File {save_file} already exists, skipping download.")
+                continue
 
+            request = {
+                'variable': self.variable,
+                'year': date.strftime('%Y'),
+                'month': date.strftime('%m'),
+                'day': date.strftime('%d'),
+                'time': [time],
+                'format': 'netcdf'
+            }
 
-# 下载脚本
-class DownloadWorker(Thread):
-    def __init__(self, queue):
-        Thread.__init__(self)
-        self.queue = queue
+            print(f"Downloading data for {date.strftime('%Y-%m-%d')} {time} to {save_file}")
+            try:
+                self.client.retrieve(self.dataset, request).download(save_file)
+            except Exception as e:
+                print(f"Failed to download data for {date.strftime('%Y-%m-%d')} {time}: {e}")
+            finally:
+                self.queue.task_done()
 
-    def run(self):
-        while True:
-            # 从队列中获取任务并扩展tuple
-            riqi = self.queue.get()
-            downloadonefile(riqi)
-            self.queue.task_done()
+    def start_download(self):
+        threads = []
+        for _ in range(self.max_threads):
+            thread = threading.Thread(target=self._download_data)
+            thread.start()
+            threads.append(thread)
 
+        for thread in threads:
+            thread.join()
 
-# 主程序
-def main():
+if __name__ == "__main__":
+    # 配置部分
+    dataset = "reanalysis-era5-land"
+    variable = ['2m_temperature']  # 可以修改为其他变量
+    start_date = datetime(2017, 11, 1)  # 设置起始时间
+    end_date = datetime(2017, 11, 30)  # 设置结束时间
+    save_path = r'D:\每日工作\era5下载\data'  # 设置保存文件夹路径
+    max_threads = 4  # 设置最大线程数
 
-
-    # 起始日期
-    begin_date = datetime.date(1980, 1, 1)
-    end_date = datetime.date(2021, 12, 31)
-    temp_date = begin_date
-    delta = datetime.timedelta(days=1)
-
-    # 建立下载日期序列
-    queue = Queue()
-    while temp_date <= end_date:
-
-        queue.put(
-            {'year':str(temp_date.year),
-             'month': str(temp_date.month).zfill(2),
-             'day': str(temp_date.day).zfill(2)
-             })
-        temp_date += delta
-
-    # 注意，每个用户同时最多接受4个request https://cds.climate.copernicus.eu/vision
-    # 创建4个工作线程
-    for x in range(4):
-        worker = DownloadWorker(queue)
-        # 将daemon设置为True将会使主线程退出，即使所有worker都阻塞了
-        worker.daemon = True
-        worker.start()
-
-    queue.join()
-
-
-if __name__ == '__main__':
-    main()
+    # 初始化并启动下载
+    downloader = Era5Downloader(dataset, variable, start_date, end_date, save_path, max_threads)
+    downloader.start_download()
