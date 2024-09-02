@@ -1,222 +1,63 @@
-import json
-import requests
-import sys
-import time
 import os
-import re
 import threading
-import datetime
-import pandas as pd
-
-os.environ["http_proxy"] = "http://127.0.0.1:10810"
-os.environ["https_proxy"] = "http://127.0.0.1:10810"
-
-path = r"F:\github\dowload_landsat\data"  # Fill a valid download path
-maxthreads = 5  # Threads count for downloads
-sema = threading.Semaphore(value=maxthreads)
-label = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")  # Customized label using date time
-threads = []
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from landsatxplore.api import API
+from landsatxplore.earthexplorer import EarthExplorer
 
 
-
-
-# Send http request
-def sendRequest(url, data, apiKey=None, exitIfNoResponse=True):
-    json_data = json.dumps(data)
-
-    if apiKey == None:
-        response = requests.post(url, json_data)
-    else:
-        headers = {'X-Auth-Token': apiKey}
-        response = requests.post(url, json_data, headers=headers)
-
+# 配置多线程下载函数
+def download_scene(scene, output_dir, username, password):
+    ee = EarthExplorer(username, password)
     try:
-        httpStatusCode = response.status_code
-        if response == None:
-            print("No output from service")
-            if exitIfNoResponse:
-                sys.exit()
-            else:
-                return False
-        output = json.loads(response.text)
-        if output['errorCode'] != None:
-            print(output['errorCode'], "- ", output['errorMessage'])
-            if exitIfNoResponse:
-                sys.exit()
-            else:
-                return False
-        if httpStatusCode == 404:
-            print("404 Not Found")
-            if exitIfNoResponse:
-                sys.exit()
-            else:
-                return False
-        elif httpStatusCode == 401:
-            print("401 Unauthorized")
-            if exitIfNoResponse:
-                sys.exit()
-            else:
-                return False
-        elif httpStatusCode == 400:
-            print("Error Code", httpStatusCode)
-            if exitIfNoResponse:
-                sys.exit()
-            else:
-                return False
+        ee.download(identifier=scene['entity_id'], output_dir=output_dir)
+        result = (scene['entity_id'], True)  # 下载成功
     except Exception as e:
-        response.close()
-        print(e)
-        if exitIfNoResponse:
-            sys.exit()
-        else:
-            return False
-    response.close()
-
-    return output['data']
+        print(f"Error downloading {scene['entity_id']}: {e}")
+        result = (scene['entity_id'], False)  # 下载失败
+    finally:
+        ee.logout()
+    return result
 
 
-def downloadFile(url):
-    sema.acquire()
-    try:
-        response = requests.get(url, stream=True)
-        disposition = response.headers['content-disposition']
-        filename = re.findall("filename=(.+)", disposition)[0].strip("\"")
-        print(f"Downloading {filename} ...\n")
-        if path != "" and path[-1] != "/":
-            filename = "/" + filename
-        open(path + filename, 'wb').write(response.content)
-        print(f"Downloaded {filename}\n")
-        sema.release()
-    except Exception as e:
-        print(f"Failed to download from {url}. Will try to re-download.")
-        sema.release()
-        runDownload(threads, url)
+# 主程序
+def main(username, password, output_dir, max_workers=4):
+    # 初始化API并搜索Landsat影像
+    api = API(username, password)
+    scenes = api.search(
+        dataset='landsat_ot_c2_l1',  # 数据集名称
+        latitude=34.0522,
+        longitude=-118.2437,
+        start_date='2020-01-01',
+        end_date='2020-12-31',
+        max_cloud_cover=10
+    )
+
+    print(f"{len(scenes)} scenes found.")
+
+    # 使用线程池进行多线程下载
+    download_results = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(download_scene, scene, output_dir, username, password) for scene in scenes]
+        for future in as_completed(futures):
+            result = future.result()
+            download_results.append(result)
+            print(f"Downloaded {result[0]}: {'Success' if result[1] else 'Failed'}")
+
+    # 关闭API连接
+    api.logout()
+
+    # 保存下载结果到文件
+    results_file = os.path.join(output_dir, 'download_results.txt')
+    with open(results_file, 'w') as f:
+        for entity_id, success in download_results:
+            f.write(f"{entity_id}: {'Success' if success else 'Failed'}\n")
+    print(f"Download results saved to {results_file}")
 
 
-def runDownload(threads, url):
-    thread = threading.Thread(target=downloadFile, args=(url,))
-    threads.append(thread)
-    thread.start()
-
-
-if __name__ == '__main__':
-
+# 执行程序
+if __name__ == "__main__":
     username = 'landsat8guoxiaozheng'
     password = 'N34EWUxTy2jizXR'
-    filetype = 'bundle'
-
-    print("\nRunning Scripts...\n")
-    startTime = time.time()
-
-    serviceUrl = "https://m2m.cr.usgs.gov/api/api/json/stable/"
-
-    # Login
-    payload = {'username': username, 'password': password}
-    apiKey = sendRequest(serviceUrl + "login", payload)
-    print("API Key: " + apiKey + "\n")
-
-    # Read scenes
-    f = pd.read_excel(r'F:\github\dowload_landsat\all.xlsx')
-
-    datasetName = 'landsat_ot_c2_l1'
-
-
-    print("Scenes details:")
-    print(f"Dataset name: {datasetName}")
-
-    entityIds = list(f['Landsat Sc'].values)
-
-
-    listId = f"temp_{datasetName}_list"  # customized list id
-
-
-    # Get download options
-    payload = {
-        "listId": listId,
-        "entityIds": entityIds,
-        "datasetName": datasetName
-    }
-
-    print("Getting product download options...\n")
-    products = sendRequest(serviceUrl + "download-options", payload, apiKey)
-    print("Got product download options\n")
-
-
-    # Select products
-    downloads = []
-
-    # select bundle files
-    for product in products:
-        if product["bulkAvailable"]:
-            if 'Bundle' in product["productName"]:
-                downloads.append({"entityId": product["entityId"], "productId": product["id"]})
-
-    # Send download-request
-    payLoad = {
-        "downloads": downloads,
-        "label": label,
-        'returnAvailable': True
-    }
-
-    print(f"Sending download request ...\n")
-    results = sendRequest(serviceUrl + "download-request", payLoad, apiKey)
-    print(f"Done sending download request\n")
-    save_data=[]
-    for result in results['availableDownloads']:
-        print(f"Get download url: {result['url']}\n")
-        runDownload(threads, result['url'])
-        save_data.append(result['url'])
-    save_data=pd.DataFrame({'url':save_data})
-    save_data.to_excel('out.xls')
-    preparingDownloadCount = len(results['preparingDownloads'])
-    preparingDownloadIds = []
-    if preparingDownloadCount > 0:
-        for result in results['preparingDownloads']:
-            preparingDownloadIds.append(result['downloadId'])
-
-        payload = {"label": label,
-                   "downloadApplication": "BulkDownload"}
-        # Retrieve download urls
-        print("Retrieving download urls...\n")
-        results = sendRequest(serviceUrl + "download-retrieve", payload, apiKey, False)
-        if results != False:
-            for result in results['available']:
-                if result['downloadId'] in preparingDownloadIds:
-                    preparingDownloadIds.remove(result['downloadId'])
-                    print(f"Get download url: {result['url']}\n")
-                    runDownload(threads, result['url'])
-
-            for result in results['requested']:
-                if result['downloadId'] in preparingDownloadIds:
-                    preparingDownloadIds.remove(result['downloadId'])
-                    print(f"Get download url: {result['url']}\n")
-                    runDownload(threads, result['url'])
-
-        # Don't get all download urls, retrieve again after 30 seconds
-        while len(preparingDownloadIds) > 0:
-            print(f"{len(preparingDownloadIds)} downloads are not available yet. Waiting for 30s to retrieve again\n")
-            time.sleep(30)
-            results = sendRequest(serviceUrl + "download-retrieve", payload, apiKey, False)
-            if results != False:
-                for result in results['available']:
-                    if result['downloadId'] in preparingDownloadIds:
-                        preparingDownloadIds.remove(result['downloadId'])
-                        print(f"Get download url: {result['url']}\n")
-                        runDownload(threads, result['url'])
-
-    print("\nGot download urls for all downloads\n")
-    # Logout
-    endpoint = "logout"
-    if sendRequest(serviceUrl + endpoint, None, apiKey) == None:
-        print("Logged Out\n")
-    else:
-        print("Logout Failed\n")
-
-    print("Downloading files... Please do not close the program\n")
-    for thread in threads:
-        thread.join()
-
-    print("Complete Downloading")
-
-    executionTime = round((time.time() - startTime), 2)
-    print(f'Total time: {executionTime} seconds')
+    output_dir = r'D:\code\landsat_download\test'
+    max_workers = 4  # 设置最大线程数
+    main(username, password, output_dir, max_workers)
